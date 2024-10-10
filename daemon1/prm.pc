@@ -1,0 +1,1180 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+#include <time.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <alloca.h>
+#include <errno.h>
+#include <sqlca.h>
+
+#include "common.h"
+#include "shmmap.h"
+//#include "ksuse.h"
+#include "prm.h"
+
+EXEC SQL BEGIN DECLARE SECTION;
+
+/* CONNECT DB */
+varchar id[20], pw[20];
+
+/* TEST VAL */
+int fsiz[100];
+unsigned char fptr[100][16+1];
+unsigned char fnam[100][64];
+
+/* SYSTEM EVENT */
+int ksmchsiz[100];
+unsigned char ksmchptr[100][16+1];
+
+int evNum;
+int evWaits;
+int evWaitm;
+
+char kqfconam[100][128];
+int  kqfcooff[100];
+int  ksleiCnt;
+
+/* SYSTEM STAT */
+int ksmfssiz;
+unsigned char ksmfsadr[16+1];
+
+int statCnt;
+int ustatCnt;
+int sesCnt;
+
+/* USER SESSION */
+int rs_ksuse;
+
+int i, j, t_cnt, r_cnt;
+
+EXEC SQL END DECLARE SECTION;
+
+LinkedList l_shm;
+Mmaps *maps = NULL;
+int shmlen = 0;
+void* shmBase = NULL;
+
+OFF_kslei off_kslei;
+OFF_ksuse off_ksuse;
+
+pthread_mutex_t queueMutex = PTHREAD_MUTEX_INITIALIZER;
+
+ready r_status = {0, 0};
+
+int connDB() {
+   EXEC SQL WHENEVER SQLERROR DO sql_error("Oracle error \n");
+   get_userinfo(&id, &pw);
+   EXEC SQL CONNECT :id IDENTIFIED BY :pw;
+}
+
+void get_userinfo(varchar *id, varchar *pw) {
+
+   strcpy((char*)(id->arr), "sherpa");
+   id->len = strlen((char*)(id->arr));
+
+   strcpy((char*)(pw->arr), "sherpa");
+   pw->len = strlen((char*)(pw->arr));
+}
+
+void sql_error(char *msg) {
+
+   char err_msg[512];
+   int buff_len, msg_len;
+
+   EXEC SQL WHENEVER SQLERROR CONTINUE;
+   printf("\n%s\n",msg);
+
+   buff_len = sizeof(err_msg);
+   sqlglm(err_msg, &buff_len, &msg_len);
+   printf("%.*s\n", msg_len, err_msg);
+
+   EXEC SQL ROLLBACK RELEASE;
+   exit(1);
+}
+
+void sqlerror_check(char *msg) {
+   
+   if(sqlca.sqlcode != 0) {
+      if(sqlca.sqlcode == 1403) {
+         printf("\n%s\n", msg);
+         exit(1);
+      }
+      else {
+         sql_error("Oracle error \n");
+      }
+   }
+}
+
+void initQueue(StatQueue *queue) {
+   queue->front = 0;
+   queue->rear = -1;
+   queue->count = 0;
+}
+
+int isQueueEmpty(StatQueue *queue) {
+   return queue->count == 0;
+}
+
+int isQueueFull(StatQueue *queue) {
+   return queue->count == QUEUE_SIZE;
+}
+
+void enqueue(StatQueue *queue) {
+
+    time_t current_time;
+    struct tm *time_info;
+    char *time_string = (char *)malloc(15 * sizeof(char));
+
+    time(&current_time);
+    time_info = localtime(&current_time);
+    strftime(time_string, 15, "%Y%m%d%H%M%S", time_info);
+
+   //pthread_mutex_lock(&queueMutex);
+   if (isQueueFull(queue)) {
+      free(queue->data[queue->front]);
+      free(queue->user[queue->front]);
+      queue->front = (queue->front + 1) % QUEUE_SIZE;
+   } else {
+      queue->count++;
+   }
+   queue->rear = (queue->rear + 1) % QUEUE_SIZE;
+   queue->data[queue->rear] = r_status.data;
+   queue->user[queue->rear] = r_status.user;
+   queue->time[queue->rear] = time_string;
+   //pthread_mutex_unlock(&queueMutex);
+}
+
+Stat* dequeue(StatQueue *queue) {
+   //pthread_mutex_lock(&queueMutex);
+   if (queue->count == 0) {
+       return NULL;
+   }
+   Stat *data = queue->data[queue->front];
+   queue->front = (queue->front + 1) % QUEUE_SIZE;
+   queue->count--;
+   return data;
+   //pthread_mutex_unlock(&queueMutex);
+}
+
+void printQueue(StatQueue *queue) {
+    int i = queue->front;
+    int j = 0;
+   
+   printf("queue count, front : %d\n", queue->count, queue->front);
+   printf("=================================\n");
+   while(j < queue->count) {
+      printf("queue[%d] : %d %d %lx\n", j, ((Stat *)queue->data[i])[1].VALUE, (Stat *)queue->data[i][9].VALUE, queue->data[i]);
+      i = (i + 1) % QUEUE_SIZE;
+      j++;
+   }
+   printf("=================================\n\n");
+}
+
+void storeSnapshotInQueue(StatQueue *queue, void *input, int type) {
+   int i;
+   if (type==0) {
+      Stat *snapshot = (Stat *)malloc(sizeof(Stat) * queue->data_count[0]);
+      Stat *arrStat = (Stat *)input;
+      for ( i=0; i < queue->data_count[0]; i++) {
+         snapshot[i] = arrStat[i];
+      }
+
+      r_status.data = snapshot;
+      r_status.s_ready = 1;
+   } 
+   else if (type==1){
+      Ksuse *snapshot = (Ksuse *)malloc(sizeof(Ksuse) * queue->data_count[1]);
+      Ksuse *arrKsuse = (Ksuse *)input;
+      for ( i=0; i < queue->data_count[1]; i++) {
+         snapshot[i] = arrKsuse[i];
+      }
+
+      r_status.user = snapshot;
+      r_status.u_ready = 1;
+   }
+
+   if (r_status.s_ready && r_status.u_ready) {
+      enqueue(queue);
+      r_status.s_ready = 0;
+      r_status.u_ready = 0;
+   }
+}
+
+void inqueryProc() {
+
+   EXEC SQL
+   select KSMFSADR, KSMFSSIZ INTO:ksmfsadr, :ksmfssiz
+     from SYS.SPX$KSMFSV
+    where KSMFSNAM='ksusga_';
+
+   if(sqlca.sqlcode != 0) {
+      if(sqlca.sqlcode == 1403) {
+         printf("no result ksuga_");
+         exit(1);
+      }
+      else {
+         sql_error("Oracle error \n");        
+      }
+   }
+ 
+   EXEC SQL
+   select count(1) INTO:statCnt
+     from v$sysstat;
+
+   sqlerror_check("statCnt");
+   
+   EXEC SQL
+   select min(statistic#) INTO:ustatCnt 
+     from V$STATNAME 
+    where CLASS>200;
+   
+   sqlerror_check("ustatCnt");
+
+   EXEC SQL
+   select count(1) INTO :sesCnt 
+     from SYS.SPX$KSUSE;
+
+   sqlerror_check("sesCnt");
+
+   EXEC SQL
+   select KSMFSADR, KSMFSSIZ INTO:ksmfsadr, :ksmfssiz
+     from SYS.SPX$KSMFSV
+    where KSMFSNAM='ksusga_';
+
+   sqlerror_check("ksusga_");
+   
+   EXEC SQL DECLARE c_kqfco_user CURSOR FOR
+   select distinct C.KQFCONAM, C.KQFCOOFF INTO:kqfconam, :kqfcooff
+     from SYS.SPX$KQFCO C ,SYS.SPX$KQFTA T
+    where T.INDX=C.KQFCOTAB and T.KQFTANAM in ('X$KSUSE','X$KSUSECST')
+      and C.KQFCOOFF <> 0
+    order by C.KQFCOOFF;
+
+   EXEC SQL
+   select to_number(b.addr,'xxxxxxxxxxxxxxxx') - to_number(a.addr,'xxxxxxxxxxxxxxxx') INTO :rs_ksuse
+     from (select addr from sys.spx$ksuse where indx = 1) a,
+          (select addr from sys.spx$ksuse where indx = 2) b;  
+   
+   sqlerror_check("rs_ksuse"); 
+}
+
+/*
+ * sysstat
+ */
+void s_Ksusga(void *arg) {
+
+   StatQueue *queue = (StatQueue *)arg;
+
+   queue->data_count[0] = statCnt;
+   
+   struct _stat *arrStat = (struct _stat *)malloc(statCnt * sizeof(struct _stat));
+   struct _ustat *ustatAddr = (struct _ustat *)malloc(statCnt * sizeof(struct _ustat));
+  
+   uint64_t addr, saddr, uaddr, useAddr;
+
+   int scnt, ecnt, tstatCnt;
+   
+   addr = strtoul(ksmfsadr,NULL,16);
+
+   /******************
+    *  1. system stat 
+    ******************/
+   saddr = *((uint32_t*)(addr + P_STAT));
+    
+   //printf("1. sys pointer : 0x%lx\n", saddr);
+   
+   for(scnt=0 ; scnt < statCnt ; scnt ++) {
+      
+      arrStat[scnt].INDX  = scnt; 
+      arrStat[scnt].VALUE = *((uint64_t*)(saddr + 8*scnt));
+   }
+   
+   //printf("\n<SYSTEM>\n");
+   
+   /********************* 
+    * 2. find x$ksusesta 
+    *********************/
+   uaddr = *((uint32_t*)(addr + U_STAT));
+   
+   //printf("\n2. ksuse pointer : 0x%lx", uaddr);
+   //printf("\n2. ksuse first addr : 0x%lx\n", *((uint64_t*)uaddr));
+   
+   while(1) {
+
+      /* save array ksusesta addr */
+      for(ecnt=0 ; ecnt < sesCnt ; ecnt++) {
+         
+         useAddr = *((uint64_t*)(uaddr + ecnt*8));
+
+         ustatAddr[ecnt].INDX = ecnt+1;
+         ustatAddr[ecnt].ADDR = *((uint64_t*)(useAddr + OFF_SESSTAT));
+      }
+
+      /**********************
+       * 3. sum sys,ses stat 
+       **********************/
+      for(scnt=0 ; scnt < statCnt ; scnt++) {
+         arrStat[scnt].INDX  = scnt;
+         
+         /* 2024.09.11 Add SYS */
+         arrStat[scnt].SYS   = *((uint64_t*)(saddr + 8*scnt));
+
+         /* process last non-idle time*/
+         if(scnt==31 || scnt==32)
+            arrStat[scnt].VALUE = 0;
+         else
+            arrStat[scnt].VALUE = *((uint64_t*)(saddr + 8*scnt));
+      }
+      
+      for(ecnt=0 ; ecnt < sesCnt ; ecnt++) {
+         
+         useAddr = *((uint64_t*)(uaddr + ecnt*8));
+         
+         /* KSUSEFLG OFFSET 2184*/
+         if((*((char*)useAddr)&1) != 0 && (*((short*)(useAddr + 2184))&1) != 0) {
+            for(scnt=0 ; scnt < ustatCnt ; scnt++) {
+               
+              /**********************************
+               * db block gets partition
+               **********************************/
+               /* db block gets from cache */
+               if(scnt==160) {
+                  arrStat[14].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[159].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* db block gets from cache (fastpath) */
+               else if(scnt==161) {
+                  arrStat[14].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[159].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[160].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* db block gets direct */
+               else if(scnt==162) {
+                  arrStat[14].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[159].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+
+              /**********************************
+               * consistent gets partition
+               **********************************/
+               /* consistent gets from cache */
+               else if(scnt==164) {
+                  arrStat[14].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[163].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* consistent gets pin */
+               else if(scnt==165) {
+                  arrStat[14].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[163].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[164].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* consistent gets pin (fastpath) */
+               else if(scnt==166) {
+                  arrStat[14].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[163].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[164].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[165].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* consistent gets examination */
+               else if(scnt==167) {
+                  arrStat[14].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[163].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[164].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* consistent gets examination (fastpath) */
+               else if(scnt==168) {
+                  arrStat[14].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[163].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[164].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[167].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* consistent gets direct */
+               else if(scnt==169) {
+                  arrStat[14].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[163].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+
+              /**********************************
+               * physical reads partition
+               **********************************/
+               /* physical reads cache */
+               else if(scnt==173) {
+                  arrStat[172].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* physical read flash cache hits */
+               else if(scnt==174) {
+                  arrStat[172].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  arrStat[173].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* physical reads direct */
+               else if(scnt==175) {
+                  arrStat[172].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               
+              /**********************************
+               * physical writes partition
+               **********************************/
+               /* physical writes direct */
+               else if(scnt==184 ) {
+                  arrStat[183].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* physical writes from cache */
+               else if(scnt==185) {
+                  arrStat[183].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               
+              /**********************************
+               * redo writes
+               **********************************/
+               else if(scnt>=321 && scnt<=328) {
+                  arrStat[320].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+              /**********************************
+               * redo blocks written
+               **********************************/
+               else if(scnt>=333 && scnt<=340) {
+                  arrStat[332].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+
+              /**********************************
+               * commit batch/immediate requested
+               **********************************/
+               /* commit batch requested */
+               else if(scnt==685) {
+                  arrStat[684].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* commit immediate requested */
+               else if(scnt==686) {
+                  arrStat[684].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+
+              /**********************************
+               * commit batch/immediate performed
+               **********************************/
+               /* commit batch requested */
+               else if(scnt==688) {
+                  arrStat[687].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* commit immediate requested */
+               else if(scnt==689) {
+                  arrStat[687].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+
+              /**********************************
+               * commit wait/nowait requested
+               **********************************/
+               /* commit nowait requested */
+               else if(scnt==691) {
+                  arrStat[690].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* commit wait requested */
+               else if(scnt==692) {
+                  arrStat[690].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+
+              /**********************************
+               * commit wait/nowait performed
+               **********************************/
+               /* commit nowait performed */
+               else if(scnt==694) {
+                  arrStat[693].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+               /* commit wait performed */
+               else if(scnt==695) {
+                  arrStat[693].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+
+               /**********************************
+                * db block gets, consistent gets
+                **********************************/
+               else if(scnt==159 || scnt==163) {
+                  arrStat[14].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+               }
+
+               /**********************************
+                * process last non-idle time
+                **********************************/
+               else if(scnt==32) {
+                  if(arrStat[scnt].VALUE < *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt))) {
+                     arrStat[scnt].VALUE = *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  }
+                  continue;
+               }
+
+               /**********************************
+                * time (stat 23~30)
+                **********************************/
+               else if(scnt>=23 && scnt<=30) {
+                  arrStat[scnt].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+                  continue;
+               }
+
+               arrStat[scnt].VALUE += *((uint64_t*)(ustatAddr[ecnt].ADDR + 8*scnt));
+            }
+         }
+      }
+
+      for(tstatCnt=23 ; tstatCnt<=30 ; tstatCnt++) {
+         if(tstatCnt==29) continue;
+         arrStat[tstatCnt].VALUE /= 10000;
+      }
+
+      storeSnapshotInQueue(queue, arrStat, 0);
+      //printQueue(queue, statCnt);
+      
+      sleep(DATA_INTERVAL);
+   }
+}
+
+void s_Ksuse(void *arg) {
+
+   StatQueue *queue = (StatQueue *)arg;
+   
+   /*******************
+    * 1. x$ksuse addr
+    *******************/
+   uint64_t addr, uaddr, useAddr;
+   
+   int secnt, alcnt;
+
+   char *kqfconam_t;
+   
+   addr = strtoul(ksmfsadr,NULL,16);
+   
+   uaddr = *((uint32_t*)(addr + U_STAT));
+   
+   printf("\nksuse pointer    : 0x%lx", uaddr);
+   
+   printf("\nksuse first addr : 0x%lx", *((uint64_t*)uaddr));
+
+   /*****************
+    * 2. inq offset
+    *****************/
+   t_cnt=0;
+   
+   EXEC SQL OPEN c_kqfco_user;
+
+   while(1) {
+      EXEC SQL FETCH c_kqfco_user
+      INTO :kqfconam, :kqfcooff;
+      
+      if(sqlca.sqlcode != 0 && sqlca.sqlcode != 1403) {
+         fprintf(stderr, "FETCH ERROR: %.*s\n", sqlca.sqlerrm.sqlerrml, sqlca.sqlerrm.sqlerrmc);
+         return -1;
+      }
+
+      r_cnt = sqlca.sqlerrd[2] - t_cnt;
+      t_cnt = sqlca.sqlerrd[2];
+      
+      for(i=0 ; i<r_cnt ; i++) {
+         kqfconam_t = rtrim(kqfconam[i]);
+         
+         if(strstr(kqfconam_t, "KSUSESER") > 0) {
+            off_ksuse.OFF_SERIAL_ = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUUDSES") == 0) {
+            off_ksuse.OFF_AUDSID = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUUDLUI") == 0) {
+            off_ksuse.OFF_USERNUMBER = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUUDLNA") == 0) {
+            off_ksuse.OFF_USERNAME = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUUDOCT") == 0) {
+            off_ksuse.OFF_COMMAND = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEFLG") == 0) {
+            off_ksuse.OFF_KSUSEFLG = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEIDL") == 0) {
+            off_ksuse.OFF_KSUSEIDL = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUUDSID") == 0) {
+            off_ksuse.OFF_SCHEMA_ = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUUDSNA") == 0) {
+            off_ksuse.OFF_SCHEMANAME = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEUNM") == 0) {
+            off_ksuse.OFF_OSUSER = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEPID") == 0) {
+            off_ksuse.OFF_PROCESS = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEMNM") == 0) {
+            off_ksuse.OFF_MACHINE = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEMNP") == 0) {
+            off_ksuse.OFF_PORT = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSETID") == 0) {
+            off_ksuse.OFF_TERMINAL = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEPNM") == 0) {
+            off_ksuse.OFF_PROGRAM = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSESQL") == 0) {
+            off_ksuse.OFF_SQL_ADDRESS = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSESQH") == 0) {
+            off_ksuse.OFF_SQL_HASH_VALUE = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSESCH") == 0) {
+            off_ksuse.OFF_SQL_CHILD_NUMBER = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSESESTA") == 0) {
+            off_ksuse.OFF_SQL_EXEC_START = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSESEID") == 0) {
+            off_ksuse.OFF_SQL_EXEC_ID = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEPSQ") == 0) {
+            off_ksuse.OFF_PREV_SQL_ADDR = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEPHA") == 0) {
+            off_ksuse.OFF_PREV_HASH_VALUE = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEPCH") == 0) {
+            off_ksuse.OFF_PREV_CHILD_NUMBER = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEPESTA") == 0) {
+            off_ksuse.OFF_PREV_EXEC_START = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEPEID") == 0) {
+            off_ksuse.OFF_PREV_EXEC_ID = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEPEO") == 0) {
+            off_ksuse.OFF_KSUSEPEO = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEPES") == 0) {
+            off_ksuse.OFF_KSUSEPES = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEPCO") == 0) {
+            off_ksuse.OFF_KSUSEPCO = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEPCS") == 0) {
+            off_ksuse.OFF_KSUSEPCS = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSECLI") == 0) {
+            off_ksuse.OFF_CLIENT_INFO = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEFIX") == 0) {
+            off_ksuse.OFF_FIXED_TABLE_SEQUENCE = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEOBJ") == 0) {
+            off_ksuse.OFF_ROW_WAIT_OBJ_ = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEFIL") == 0) {
+            off_ksuse.OFF_ROW_WAIT_FILE_ = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEBLK") == 0) {
+            off_ksuse.OFF_ROW_WAIT_BLOCK_ = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSESLT") == 0) {
+            off_ksuse.OFF_ROW_WAIT_ROW_ = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEORAFN") == 0) {
+            off_ksuse.OFF_TOP_LEVEL_CALL_ = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSELTM") == 0) {
+            off_ksuse.OFF_LOGON_TIME = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSECLID") == 0) {
+            off_ksuse.OFF_CLIENT_IDENTIFIER = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSESEQ") == 0) {
+            off_ksuse.OFF_SEQ_ = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEOPC") == 0) {
+            off_ksuse.OFF_EVENT_ = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEP1") == 0) {
+            off_ksuse.OFF_P1 = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEP2") == 0) {
+            off_ksuse.OFF_P2 = kqfcooff[i];
+         }
+         else if(strcmp(kqfconam_t, "KSUSEP3") == 0) {
+            off_ksuse.OFF_P3 = kqfcooff[i];
+         }
+      }
+
+      if(sqlca.sqlcode == 1403)
+         break;
+   }
+   
+   /****************************************
+    * 3. save array user session information
+    ****************************************/  
+
+   printf("\nsesCnt, rw_ksuse : %d, %d\n\n", sesCnt, rs_ksuse);
+   
+   //struct _ksuse arrKsuse[sesCnt];
+   struct _ksuse *arrKsuse = (struct _ksuse *)malloc(sesCnt * sizeof(struct _ksuse));
+   
+   uint64_t t_int;
+   
+   while(1) {
+
+      queue->data_count[1] = 0;
+   
+      for(alcnt=0 ; alcnt < sesCnt ; alcnt++) {
+         
+         useAddr = *(uint64_t*)(uaddr + alcnt*8);
+         
+         if((*((char*)useAddr)&1) == 0 || (*((short*)(useAddr + off_ksuse.OFF_KSUSEFLG))&1) == 0)
+            continue;
+
+         secnt = queue->data_count[1]++;
+
+         /* INST_ID(X) */
+         //arrKsuse[secnt].INST_ID = ;
+         
+         /* SADDR */
+         arrKsuse[secnt].SADDR = useAddr;
+         //printf("SADDR : %lx | ", arrKsuse[secnt].SADDR);
+         
+         /* SID */
+         arrKsuse[secnt].SID = alcnt+1;
+         //printf("SID : %3d | ", arrKsuse[secnt].SID);
+         
+         /* SERIAL_ */ 
+         arrKsuse[secnt].SERIAL_ = *(int*)(useAddr + off_ksuse.OFF_SERIAL_);
+         //printf("SERIAL_ : %5d | ", arrKsuse[secnt].SERIAL_);
+         
+         /* AUDSID */
+         arrKsuse[secnt].AUDSID = *(int*)(useAddr + off_ksuse.OFF_SERIAL_);
+         //printf("AUDSID : %5d | ", arrKsuse[secnt].AUDSID);
+         
+         /* PADDR */
+         arrKsuse[secnt].PADDR = *(uint64_t*)(useAddr+8);
+         //printf("PADDR : %lx | ", arrKsuse[secnt].PADDR);
+
+         /* USERNUMBER */
+         arrKsuse[secnt].USERNUMBER = *(int*)(useAddr+off_ksuse.OFF_USERNUMBER);
+         //printf("USERNUMBER : %3d | ", arrKsuse[secnt].USERNUMBER);
+
+         /* USERNAME */
+         h_str(&(arrKsuse[secnt].USERNAME), useAddr+off_ksuse.OFF_USERNAME);
+         //printf("USERNAME : %15s | ", arrKsuse[secnt].USERNAME);
+         
+         /* COMMAND */
+         arrKsuse[secnt].COMMAND = *(int*)(useAddr+off_ksuse.OFF_COMMAND);
+         //printf("COMMAND : %3d | ", arrKsuse[secnt].COMMAND);
+
+         /* 
+          * STATUS
+          * decode(bitand(s.ksuseidl,11),1,'ACTIVE',0,decode(bitand(s.ksuseflg,4096),0,'INACTIVE','CACHED'),2,'SNIPED',3,'SNIPED', 'KILLED')
+          */
+         switch(*(short*)(useAddr+off_ksuse.OFF_KSUSEIDL)&11) {
+            case 1 :
+               p_str(arrKsuse[secnt].STATUS, "ACTIVE");
+               break;
+
+            case 0 :
+               if((*(short*)(useAddr + off_ksuse.OFF_KSUSEFLG)&4096) == 0) {
+                  p_str(arrKsuse[secnt].STATUS, "INACTIVE");
+               }
+               else {
+                  p_str(arrKsuse[secnt].STATUS, "CACHED");
+               }
+               break;
+
+            case 2 :
+            case 3 :
+               p_str(arrKsuse[secnt].STATUS, "SNIPED");
+               break;
+
+            default : 
+               p_str(arrKsuse[secnt].STATUS, "KILLED");
+               break;
+         }
+         //printf("STATUS : %9s | ", arrKsuse[secnt].STATUS);
+         
+         /* SCHEMA_ */
+         arrKsuse[secnt].SCHEMA_ = *(int*)(useAddr+off_ksuse.OFF_SCHEMA_);
+         //printf("SCHEMA_ : %2d | ", arrKsuse[secnt].SCHEMA_);
+
+         /* SCHEMANAME */
+         h_str(&(arrKsuse[secnt].SCHEMANAME), useAddr+off_ksuse.OFF_SCHEMANAME);
+         //printf("SCHEMANAME : %8s | ", arrKsuse[secnt].SCHEMANAME);
+         
+         /* OSUSER */
+         h_str(&(arrKsuse[secnt].OSUSER), useAddr+off_ksuse.OFF_OSUSER);
+         //printf("OSUSER : %8s | ", arrKsuse[secnt].OSUSER);
+         
+         /* PROCESS */
+         h_str(&(arrKsuse[secnt].PROCESS), useAddr+off_ksuse.OFF_PROCESS);
+         //printf("PROCESS : %10s | ", arrKsuse[secnt].PROCESS);
+         
+         /* MACHINE */
+         h_str(&(arrKsuse[secnt].MACHINE), useAddr+off_ksuse.OFF_MACHINE);
+         //printf("MACHINE : %15s | ", arrKsuse[secnt].MACHINE);
+
+         /* PORT */
+         arrKsuse[secnt].PORT = *(int*)(useAddr + off_ksuse.OFF_PORT);
+         //printf("PORT : %5d | ", arrKsuse[secnt].PORT);
+
+         /* TERMINAL */
+         h_str(&(arrKsuse[secnt].TERMINAL), useAddr+off_ksuse.OFF_TERMINAL);
+         //printf("TERMINAL : %10s | ", arrKsuse[secnt].TERMINAL);
+
+         /* PROGRAM */
+         h_str(&(arrKsuse[secnt].PROGRAM), useAddr+off_ksuse.OFF_PROGRAM);
+         //printf("PROGRAM : %20s | ", arrKsuse[secnt].PROGRAM);
+
+         /* 
+          * TYPE
+          * decode(bitand(ksuseflg,19),17,'BACKGROUND',1,'USER',2,'RECURSIVE','?')
+          */
+         switch(*(short*)(useAddr+off_ksuse.OFF_KSUSEFLG)&19) {
+            case 17 :
+               p_str(arrKsuse[secnt].TYPE, "BACKGROUND");
+               break;
+
+            case 1 :
+               p_str(arrKsuse[secnt].TYPE, "USER");
+               break;
+
+            case 2 :
+               p_str(arrKsuse[secnt].TYPE, "RECURSIVE");
+               break;
+
+            default : 
+               p_str(arrKsuse[secnt].TYPE, "?");
+               break;
+         }
+         //printf("TYPE : %11s | ", arrKsuse[secnt].TYPE);
+         
+         /* SQL_ADDRESS */
+         arrKsuse[secnt].SQL_ADDRESS = *(uint64_t*)(useAddr+off_ksuse.OFF_SQL_ADDRESS);
+         //printf("SQL_ADDRESS : %8lx | ", arrKsuse[secnt].SQL_ADDRESS);
+
+         /* SQL_HASH_VALUE */
+         arrKsuse[secnt].SQL_HASH_VALUE = *(int*)(useAddr+off_ksuse.OFF_SQL_HASH_VALUE);
+         //printf("SQL_HASH_VALUE : %13u | ", arrKsuse[secnt].SQL_HASH_VALUE);
+
+         /* SQL_ID */
+         if(arrKsuse[secnt].SQL_ADDRESS != 0) {
+            t_int = *(uint32_t*)(*(uint64_t*)(useAddr+off_ksuse.OFF_SQL_ADDRESS)+368) * (uint64_t)pow(16.0,8.0) + *(uint32_t*)(*(uint64_t*)(useAddr+off_ksuse.OFF_SQL_ADDRESS)+372);   
+            setBase32(arrKsuse[secnt].SQL_ID, t_int);
+         }
+         else {
+            p_str(arrKsuse[secnt].SQL_ID, "");
+         }
+         //printf("SQL_ID : %13s | ", arrKsuse[secnt].SQL_ID);
+
+         /* SQL_TEXT */
+         if(arrKsuse[secnt].SQL_ADDRESS != 0) {
+            h_str(&(arrKsuse[secnt].SQL_TEXT), *(uint64_t*)(useAddr+off_ksuse.OFF_SQL_ADDRESS)+DEF_OFF_SQLTEXT);
+         }
+         else {
+            p_str(arrKsuse[secnt].SQL_TEXT, "");
+         }
+         //printf("SQL_TEXT : %200s | ", arrKsuse[secnt].SQL_TEXT);
+
+         /* 
+          * SQL_CHILD_NUMBER 
+          * decode(s.ksusesch, 65535, to_number(null), s.ksusesch)
+          */
+         if(*(int*)(useAddr+off_ksuse.OFF_SQL_CHILD_NUMBER) == 65535) {
+            arrKsuse[secnt].SQL_CHILD_NUMBER = -1;
+         }
+         else {
+            arrKsuse[secnt].SQL_CHILD_NUMBER = *(int*)(useAddr+off_ksuse.OFF_SQL_CHILD_NUMBER);
+         }
+         //printf("SQL_CHILD_NUMBER : %5d | ", arrKsuse[secnt].SQL_CHILD_NUMBER);
+         
+         /* SQL_EXEC_START */
+         getDate(&(arrKsuse[secnt].SQL_EXEC_START), *(uint64_t*)(useAddr+off_ksuse.OFF_SQL_EXEC_START));
+         //printf("SQL_EXEC_START : %20s | ", arrKsuse[secnt].SQL_EXEC_START);
+
+         /* SQL_EXEC_ID */
+         arrKsuse[secnt].SQL_EXEC_ID = *(int*)(useAddr+off_ksuse.OFF_SQL_EXEC_ID);
+         //printf("SQL_EXEC_ID : %10d | ", arrKsuse[secnt].SQL_EXEC_ID);
+
+         /* PREV_SQL_ADDR */
+         arrKsuse[secnt].PREV_SQL_ADDR = *(uint64_t*)(useAddr+off_ksuse.OFF_PREV_SQL_ADDR);
+         //printf("PREV_SQL_ADDR : %8lx | ", arrKsuse[secnt].PREV_SQL_ADDR);
+
+         /* PREV_HASH_VALUE */
+         arrKsuse[secnt].PREV_HASH_VALUE = *(int*)(useAddr+off_ksuse.OFF_PREV_HASH_VALUE);
+         //printf("PREV_HASH_VALUE : %13u | ", arrKsuse[secnt].PREV_HASH_VALUE);
+
+         /* PREV_SQL_ID */
+         if(arrKsuse[secnt].PREV_SQL_ADDR != 0) {
+            t_int = *(uint32_t*)(*(uint64_t*)(useAddr+off_ksuse.OFF_PREV_SQL_ADDR)+368) * (uint64_t)pow(16.0,8.0) + *(uint32_t*)(*(uint64_t*)(useAddr+off_ksuse.OFF_PREV_SQL_ADDR)+372);   
+            setBase32(arrKsuse[secnt].PREV_SQL_ID, t_int);
+         }
+         else {
+            p_str(arrKsuse[secnt].PREV_SQL_ID, "");
+         }
+         //printf("PREV_SQL_ID : %13s | ", arrKsuse[secnt].PREV_SQL_ID);
+
+         /* PREV_SQL_TEXT */
+         if(arrKsuse[secnt].PREV_SQL_ADDR != 0) {
+            h_str(&(arrKsuse[secnt].PREV_SQL_TEXT), *(uint64_t*)(useAddr+off_ksuse.OFF_PREV_SQL_ADDR)+DEF_OFF_SQLTEXT);
+         }
+         else {
+            p_str(arrKsuse[secnt].PREV_SQL_TEXT, "");
+         }
+         //printf("PREV_SQL_TEXT : %200s | ", arrKsuse[secnt].PREV_SQL_TEXT);
+
+         /* 
+          * PREV_CHILD_NUMBER 
+          * decode(s.ksusesch, 65535, to_number(null), s.ksusesch)
+          */
+         if(*(int*)(useAddr+off_ksuse.OFF_PREV_CHILD_NUMBER) == 65535) {
+            arrKsuse[secnt].PREV_CHILD_NUMBER = -1;
+         }
+         else {
+            arrKsuse[secnt].PREV_CHILD_NUMBER = *(int*)(useAddr+off_ksuse.OFF_PREV_CHILD_NUMBER);
+         }
+         //printf("PREV_CHILD_NUMBER : %5d | ", arrKsuse[secnt].PREV_CHILD_NUMBER);
+         
+         /* PREV_EXEC_START */
+         getDate(&(arrKsuse[secnt].PREV_EXEC_START), *(uint64_t*)(useAddr+off_ksuse.OFF_PREV_EXEC_START));
+         //printf("PREV_EXEC_START : %20s | ", arrKsuse[secnt].PREV_EXEC_START);
+
+         /* PREV_EXEC_ID */
+         arrKsuse[secnt].PREV_EXEC_ID = *(int*)(useAddr+off_ksuse.OFF_PREV_EXEC_ID);
+         //printf("PREV_EXEC_ID : %10d | ", arrKsuse[secnt].PREV_EXEC_ID);
+
+         /* 
+          * PLSQL_ENTRY_OBJECT_ID 
+          * decode(s.ksusepeo,0,to_number(null),s.ksusepeo)
+          */
+         if(*(int*)(useAddr+off_ksuse.OFF_KSUSEPEO) == 0) {
+            arrKsuse[secnt].PLSQL_ENTRY_OBJECT_ID = -1;
+         }
+         else {
+            arrKsuse[secnt].PLSQL_ENTRY_OBJECT_ID = *(int*)(useAddr+off_ksuse.OFF_KSUSEPEO);
+         }
+         //printf("PLSQL_ENTRY_OBJECT_ID : %10d | ", arrKsuse[secnt].PLSQL_ENTRY_OBJECT_ID);         
+         
+         /* 
+          * PLSQL_ENTRY_SUBPROGRAM_ID 
+          * decode(s.ksusepeo,0,to_number(null),s.ksusepeo)
+          */
+         if(*(int*)(useAddr+off_ksuse.OFF_KSUSEPEO) == 0) {
+            arrKsuse[secnt].PLSQL_ENTRY_SUBPROGRAM_ID = -1;
+         }
+         else {
+            arrKsuse[secnt].PLSQL_ENTRY_SUBPROGRAM_ID = *(int*)(useAddr+off_ksuse.OFF_KSUSEPES);
+         }
+         //printf("PLSQL_ENTRY_SUBPROGRAM_ID : %10d | ", arrKsuse[secnt].PLSQL_ENTRY_SUBPROGRAM_ID);
+
+         /* 
+          * PLSQL_OBJECT_ID 
+          * decode(s.ksusepco, 0, to_number(null), decode(bitand(s.ksusstmbv, power(2,11)), power(2,11), s.ksusepco, to_number(null)))
+          */
+         if(*(int*)(useAddr+off_ksuse.OFF_KSUSEPCO) == 0) {
+            arrKsuse[secnt].PLSQL_OBJECT_ID = -1;
+         }
+         else {
+            if((*(int*)(useAddr+off_ksuse.OFF_KSUSSTMBV) & (uint64_t)pow(16.0,8.0)) == (uint64_t)pow(16.0,8.0)) {
+               arrKsuse[secnt].PLSQL_OBJECT_ID = *(int*)(useAddr+off_ksuse.OFF_KSUSEPCO);
+            }
+         }
+         //printf("PLSQL_OBJECT_ID : %10d | ", arrKsuse[secnt].PLSQL_OBJECT_ID);
+
+         /* 
+          * PLSQL_SUBPROGRAM_ID 
+          * decode(s.ksusepcs, 0, to_number(null), decode(bitand(s.ksusstmbv, power(2,11)), power(2,11), s.ksusepcs, to_number(null)))
+          */
+         if(*(int*)(useAddr+off_ksuse.OFF_KSUSEPCS) == 0) {
+            arrKsuse[secnt].PLSQL_SUBPROGRAM_ID = -1;
+         }
+         else {
+            if((*(int*)(useAddr+off_ksuse.OFF_KSUSSTMBV) & (uint64_t)pow(16.0,8.0)) == (uint64_t)pow(16.0,8.0)) {
+               arrKsuse[secnt].PLSQL_SUBPROGRAM_ID = *(int*)(useAddr+off_ksuse.OFF_KSUSEPCS);
+            }
+         }
+         //printf("PLSQL_SUBPROGRAM_ID : %10d | ", arrKsuse[secnt].PLSQL_SUBPROGRAM_ID);
+
+         /* MODULE */
+         h_str_l(&(arrKsuse[secnt].MODULE), *(uint64_t*)(useAddr+DEF_OFF_MODACT), *(int*)(*(uint64_t*)(useAddr+DEF_OFF_MODACT)+64));
+         //printf("@@@@@@@@@@@@MODULE : %20s | ", arrKsuse[secnt].MODULE);
+
+         /* MODULE_HASH */
+         arrKsuse[secnt].MODULE_HASH = *(uint64_t*)(*(uint64_t*)(useAddr+DEF_OFF_MODACT)+72);
+         //printf("@@@@@@@@@@@@MODULE_HASH : %u | ", arrKsuse[secnt].MODULE_HASH);
+
+         /* ACTION */
+         h_str_l(&(arrKsuse[secnt].ACTION), *(uint64_t*)(useAddr+DEF_OFF_MODACT)+76, *(int*)(*(uint64_t*)(useAddr+DEF_OFF_MODACT)+144));
+         //printf("@@@@@@@@@@@@ACTION : %20s | ", arrKsuse[secnt].ACTION);
+
+         /* ACTION_HASH */
+         arrKsuse[secnt].ACTION_HASH = *(uint64_t*)(*(uint64_t*)(useAddr+DEF_OFF_MODACT)+152);
+         //printf("@@@@@@@@@@@@ACTION_HASH : %u | ", arrKsuse[secnt].ACTION_HASH);
+
+         /* CLIENT_INFO */
+         h_str(&(arrKsuse[secnt].CLIENT_INFO), useAddr+off_ksuse.OFF_CLIENT_INFO);
+         //printf("CLIENT_INFO : %20s | ", arrKsuse[secnt].CLIENT_INFO);
+         
+         /* FIXED_TABLE_SEQUENCE */
+         arrKsuse[secnt].FIXED_TABLE_SEQUENCE = *(int*)(useAddr+off_ksuse.OFF_FIXED_TABLE_SEQUENCE);
+         //printf("FIXED_TABLE_SEQUENCE : %d | ", arrKsuse[secnt].FIXED_TABLE_SEQUENCE);
+
+         /* ROW_WAIT_OBJ_ */
+         arrKsuse[secnt].ROW_WAIT_OBJ_ = *(int*)(useAddr+off_ksuse.OFF_ROW_WAIT_OBJ_);
+         //printf("####ROW_WAIT_OBJ_ : %d | ", arrKsuse[secnt].ROW_WAIT_OBJ_);
+
+         /* ROW_WAIT_FILE_ */
+         arrKsuse[secnt].ROW_WAIT_FILE_ = *(int*)(useAddr+off_ksuse.OFF_ROW_WAIT_FILE_);
+         //printf("####ROW_WAIT_FILE_ : %d | ", arrKsuse[secnt].ROW_WAIT_FILE_);
+
+         /* ROW_WAIT_BLOCK_ */
+         arrKsuse[secnt].ROW_WAIT_BLOCK_ = *(int*)(useAddr+off_ksuse.OFF_ROW_WAIT_BLOCK_);
+         //printf("####ROW_WAIT_BLOCK_ : %d | ", arrKsuse[secnt].ROW_WAIT_BLOCK_);
+
+         /* ROW_WAIT_ROW_ */
+         arrKsuse[secnt].ROW_WAIT_ROW_ = *(int*)(useAddr+off_ksuse.OFF_ROW_WAIT_ROW_);
+         //printf("####ROW_WAIT_ROW_ : %d | ", arrKsuse[secnt].ROW_WAIT_ROW_);
+
+         /* TOP_LEVEL_CALL_ */
+         arrKsuse[secnt].TOP_LEVEL_CALL_ = *(int*)(useAddr+off_ksuse.OFF_TOP_LEVEL_CALL_);
+         //printf("####TOP_LEVEL_CALL_ : %d | ", arrKsuse[secnt].TOP_LEVEL_CALL_);
+
+         /* LOGON_TIME */
+         getLTM(&(arrKsuse[secnt].LOGON_TIME), useAddr+off_ksuse.OFF_LOGON_TIME);
+         //printf("LOGON_TIME : %20s | ", arrKsuse[secnt].LOGON_TIME);
+         
+         /* 
+          * LAST_CALL_ET
+          * case when bitand(ksuseflg,19) = 1 then case when KSUSESESTA is null then round((sysdate-KSUSEPESTA)*24*60*60,0)
+                                                   else round((sysdate-KSUSESESTA)*24*60*60,0) end
+            else round((sysdate-KSUSELTM)*24*60*60,0) end as "t_ksusectm"
+          */
+         time_t timer;
+         struct tm* t;
+
+         timer = time(NULL);
+
+         if((*((short*)(useAddr + off_ksuse.OFF_KSUSEFLG))&19) == 1) {
+
+            if(*(uint64_t*)(useAddr+off_ksuse.OFF_SQL_EXEC_START) == 0) {
+               arrKsuse[secnt].LAST_CALL_ET = timer-*(uint64_t*)(useAddr+off_ksuse.OFF_PREV_EXEC_START);
+            }
+            else {
+               arrKsuse[secnt].LAST_CALL_ET = timer-*(uint64_t*)(useAddr+off_ksuse.OFF_SQL_EXEC_START);
+            }
+         }
+         else {
+            t = localtime(&timer);
+
+            t->tm_year = (*(char*)(useAddr+off_ksuse.OFF_LOGON_TIME)-100) * 100 + (*(char*)(useAddr+off_ksuse.OFF_LOGON_TIME+1)-100) - 1900;
+            t->tm_mon  = *(char*)(useAddr+off_ksuse.OFF_LOGON_TIME+2)-1;
+            t->tm_mday = *(char*)(useAddr+off_ksuse.OFF_LOGON_TIME+3);
+            t->tm_hour = *(char*)(useAddr+off_ksuse.OFF_LOGON_TIME+4)-1;
+            t->tm_min  = *(char*)(useAddr+off_ksuse.OFF_LOGON_TIME+5)-1;
+            t->tm_sec  = *(char*)(useAddr+off_ksuse.OFF_LOGON_TIME+6)-1;
+
+            //printf("\n\n%d %d %d %d %d %d\n\n", t->tm_year, t->tm_mon, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
+
+            arrKsuse[secnt].LAST_CALL_ET = timer-mktime(t);
+
+            //printf("\n\n\n^^^^^mktime : %d^^^^^\n\n\n", mktime(t));
+            //printf("timer-mktime(t) : %d\n", timer-mktime(t));
+
+            //arrKsuse[secnt].LAST_CALL_ET = timer - 
+         }
+         //printf("$$$$$$LAST_CALL_ET&& : %20d | $$$$$$", arrKsuse[secnt].LAST_CALL_ET);
+
+         /* CLIENT_IDENTIFIER */
+         h_str(&(arrKsuse[secnt].CLIENT_IDENTIFIER), useAddr+off_ksuse.OFF_CLIENT_IDENTIFIER);
+         //printf("CLIENT_IDENTIFIER : %20s | ", arrKsuse[secnt].CLIENT_IDENTIFIER);
+
+         /* ROW_WAIT_ROW_ */
+         arrKsuse[secnt].SEQ_ = *(short*)(useAddr+off_ksuse.OFF_SEQ_);
+         //printf("####SEQ_ : %d | ", arrKsuse[secnt].SEQ_);
+
+         /* EVENT_ */
+         arrKsuse[secnt].EVENT_ = *(short*)(useAddr+off_ksuse.OFF_EVENT_);
+         //printf("####EVENT_ : %d | ", arrKsuse[secnt].EVENT_);
+
+         /* P1 */
+         arrKsuse[secnt].P1 = *(uint64_t*)(useAddr+off_ksuse.OFF_P1);
+         //printf("####P1 : %lx, %lx | ", arrKsuse[secnt].P1, arrKsuse[secnt].P1);
+
+         /* P2 */
+         arrKsuse[secnt].P2 = *(uint64_t*)(useAddr+off_ksuse.OFF_P2);
+         //printf("####P2 : %lx, %lx | ", arrKsuse[secnt].P2, arrKsuse[secnt].P2);
+
+         /* P3 */
+         arrKsuse[secnt].P3 = *(uint64_t*)(useAddr+off_ksuse.OFF_P3);
+         //printf("####P3 : %llu, 0x%016lx | ", arrKsuse[secnt].P3, arrKsuse[secnt].P3);
+         
+
+         //printf("ksspaflg : %d, ksuseflg : %d", *((char*)useAddr)&1, *((short*)(useAddr + off_ksuse.OFF_KSUSEFLG))&1);
+         //printf("\n\n");
+      }
+      
+      storeSnapshotInQueue(queue, arrKsuse, 1);
+      
+      sleep(DATA_INTERVAL);
+   }
+}
+
+void fmaps() {
+   
+   Node *current = l_shm.head;
+   
+   struct stat sb;
+   size_t flen = 0;
+   int shmfd = 0;
+   
+   shmlen = 0;
+   shmBase = NULL;
+   
+   while(current->next != NULL) {
+
+      maps = current->data;
+
+      if(strcmp(maps->fileName, ((Mmaps *)((Node *)current->next)->data)->fileName) == 0) {
+               
+         current = current->next;
+         maps = current->data;
+      }
+
+      shmfd = shm_open(maps->fileName, O_RDONLY, 0666);
+
+      if (shmfd == -1) {
+         printf("Shared memory failed:\n");
+         return (EXIT_FAILURE);
+      }
+      if (fstat(shmfd, &sb) == -1 ) {
+         printf("fstat failed:\n");
+         return (EXIT_FAILURE);
+      }
+
+      flen = sb.st_size;
+      shmlen = flen;
+      
+      //printf("lowAddr:%p, highAddr:%p and filename:%s\n", maps->lowAddr, maps->highAddr, maps->fileName);
+
+      shmBase = mmap(maps->lowAddr, shmlen, PROT_READ, MAP_SHARED | MAP_FIXED, shmfd, 0);
+      
+      /*
+      if (shmBase == -1) {
+         printf("Map failed\n");
+         printf("%d,%s\n",errno,strerror(errno));
+      }
+      if (close(shmfd) == -1) {
+         printf("Failed to close %s", shmfd);
+      }
+      */
+      
+      if(current->next != NULL) {
+         current = current->next;
+      }
+   }
+}

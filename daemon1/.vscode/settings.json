@@ -1,0 +1,15 @@
+{
+    "files.associations": {
+        "*.pc": "c",
+        "types.h": "c",
+        "stdlib.h": "c",
+        "common.h": "c",
+        "errno.h": "c",
+        "stat.h": "c",
+        "prm.h": "c",
+        "reactor.h": "c",
+        "shmmap.h": "c",
+        "ksuse.h": "c",
+        "ksst.h": "c"
+    }
+}
